@@ -15,6 +15,9 @@ struct State {
     // it gets dropped after it as the surface contains
     // unsafe references to the window's resources.
     window: Window,
+
+    // challenge related extra stuff,
+    clear_color: wgpu::Color,
 }
 
 const DEFAULT_CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -97,6 +100,7 @@ impl State {
             queue,
             config,
             size,
+            clear_color: DEFAULT_CLEAR_COLOR,
         }
     }
 
@@ -111,6 +115,10 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    pub fn change_clear_color(&mut self, clear_color: wgpu::Color) {
+        self.clear_color = clear_color;
     }
 
     fn input(&mut self, _event: &WindowEvent) -> bool {
@@ -140,7 +148,7 @@ impl State {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(DEFAULT_CLEAR_COLOR),
+                    load: wgpu::LoadOp::Clear(self.clear_color),
                     store: true,
                 },
             })],
@@ -220,6 +228,15 @@ pub async fn run() {
                             },
                         ..
                     } => *control_flow = ControlFlow::Exit,
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.change_clear_color(wgpu::Color {
+                            r: position.x / state.size.width as f64,
+                            g: position.y / state.size.height as f64,
+                            b: (position.x + position.y)
+                                / (state.size.width + state.size.height) as f64,
+                            a: 1.0,
+                        })
+                    }
                     WindowEvent::Resized(physical_size) => {
                         state.resize(*physical_size);
                     }
