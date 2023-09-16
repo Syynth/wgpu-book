@@ -21,6 +21,13 @@ struct State {
     clear_color: wgpu::Color,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct Vertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
+
 const DEFAULT_CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.1,
     g: 0.2,
