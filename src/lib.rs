@@ -8,6 +8,44 @@ use winit::{
     window::WindowBuilder,
 };
 
+struct Camera {
+    eye: cgmath::Point3<f32>,
+    target: cgmath::Point3<f32>,
+    up: cgmath::Vector3<f32>,
+    aspect: f32,
+    fov_y: f32,
+    z_near: f32,
+    z_far: f32,
+}
+
+impl Camera {
+    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+        let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
+        let proj = cgmath::perspective(
+            cgmath::Deg(self.fov_y),
+            self.aspect,
+            self.z_near,
+            self.z_far,
+        );
+
+        return OPENGL_TO_WGPU_MATRIX * proj * view;
+    }
+}
+
+// The coordinate system in Wgpu is based on DirectX, and Metal's coordinate systems.
+// That means that in normalized device coordinates (opens new window) the x axis and
+// y axis are in the range of -1.0 to +1.0, and the z axis is 0.0 to +1.0. The cgmath
+// crate (as well as most game math crates) is built for OpenGL's coordinate system.
+// This matrix will scale and translate our scene from OpenGL's coordinate system to
+// WGPU's. We'll define it as follows.
+#[rustfmt::skip]
+pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.5,
+    0.0, 0.0, 0.0, 1.0,
+);
+
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -18,8 +56,12 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+
     diffuse_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
     diffuse_texture: texture::Texture,
+
+    camera: Camera,
 
     // The window must be declared after the surface so
     // it gets dropped after it as the surface contains
@@ -27,7 +69,10 @@ struct State {
     window: Window,
 
     // challenge related extra stuff,
+    is_challenge_mode: bool,
     clear_color: wgpu::Color,
+    challenge_bind_group: wgpu::BindGroup,
+    challenge_texture: texture::Texture,
 }
 
 #[repr(C)]
@@ -151,9 +196,6 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let diffuse_bytes = include_bytes!("happy-tree.png");
-        let diffuse_texture = texture::Texture::from_bytes(&device, &queue, diffuse_bytes, "happy-tree.png").unwrap();
-
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("texture_bind_group_layout"),
@@ -177,6 +219,21 @@ impl State {
                 ],
             });
 
+        let diffuse_texture = texture::Texture::from_bytes(
+            &device,
+            &queue,
+            include_bytes!("happy-tree.png"),
+            "happy-tree.png",
+        )
+        .unwrap();
+        let challenge_texture = texture::Texture::from_bytes(
+            &device,
+            &queue,
+            include_bytes!("unhappy-tree.png"),
+            "unhappy-tree.png",
+        )
+        .unwrap();
+
         let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
             entries: &[
@@ -190,6 +247,21 @@ impl State {
                 },
             ],
             label: Some("diffuse_bind_group"),
+        });
+
+        let challenge_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&challenge_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&challenge_texture.sampler),
+                },
+            ],
+            label: Some("challenge_bind_group"),
         });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -250,6 +322,7 @@ impl State {
         let num_indices = INDICES.len() as u32;
 
         Self {
+            is_challenge_mode: false,
             window,
             render_pipeline,
             surface,
@@ -263,6 +336,8 @@ impl State {
             diffuse_bind_group,
             diffuse_texture,
             clear_color: DEFAULT_CLEAR_COLOR,
+            challenge_texture,
+            challenge_bind_group,
         }
     }
 
@@ -281,6 +356,10 @@ impl State {
 
     pub fn change_clear_color(&mut self, clear_color: wgpu::Color) {
         self.clear_color = clear_color;
+    }
+
+    pub fn toggle_challenge_mode(&mut self) {
+        self.is_challenge_mode = !self.is_challenge_mode;
     }
 
     fn input(&mut self, _event: &WindowEvent) -> bool {
@@ -318,7 +397,14 @@ impl State {
         });
 
         render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
+
+        let bind_group = if (self.is_challenge_mode) {
+            &self.challenge_bind_group
+        } else {
+            &self.diffuse_bind_group
+        };
+
+        render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
@@ -397,6 +483,15 @@ pub async fn run() {
                             },
                         ..
                     } => *control_flow = ControlFlow::Exit,
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                state: ElementState::Pressed,
+                                virtual_keycode: Some(VirtualKeyCode::Space),
+                                ..
+                            },
+                        ..
+                    } => state.toggle_challenge_mode(),
                     WindowEvent::CursorMoved { position, .. } => {
                         state.change_clear_color(wgpu::Color {
                             r: position.x / state.size.width as f64,
