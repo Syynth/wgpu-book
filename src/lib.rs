@@ -1,5 +1,9 @@
+mod camera;
+mod camera_controller;
 mod texture;
 
+use camera::*;
+use camera_controller::CameraController;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 use winit::{
@@ -7,44 +11,6 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-
-struct Camera {
-    eye: cgmath::Point3<f32>,
-    target: cgmath::Point3<f32>,
-    up: cgmath::Vector3<f32>,
-    aspect: f32,
-    fov_y: f32,
-    z_near: f32,
-    z_far: f32,
-}
-
-impl Camera {
-    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
-        let proj = cgmath::perspective(
-            cgmath::Deg(self.fov_y),
-            self.aspect,
-            self.z_near,
-            self.z_far,
-        );
-
-        return OPENGL_TO_WGPU_MATRIX * proj * view;
-    }
-}
-
-// The coordinate system in Wgpu is based on DirectX, and Metal's coordinate systems.
-// That means that in normalized device coordinates (opens new window) the x axis and
-// y axis are in the range of -1.0 to +1.0, and the z axis is 0.0 to +1.0. The cgmath
-// crate (as well as most game math crates) is built for OpenGL's coordinate system.
-// This matrix will scale and translate our scene from OpenGL's coordinate system to
-// WGPU's. We'll define it as follows.
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.5,
-    0.0, 0.0, 0.0, 1.0,
-);
 
 struct State {
     surface: wgpu::Surface,
@@ -61,7 +27,11 @@ struct State {
     #[allow(dead_code)]
     diffuse_texture: texture::Texture,
 
+    camera_controller: CameraController,
     camera: Camera,
+    camera_uniform: CameraUniform,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 
     // The window must be declared after the surface so
     // it gets dropped after it as the surface contains
@@ -185,6 +155,7 @@ impl State {
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -226,6 +197,7 @@ impl State {
             "happy-tree.png",
         )
         .unwrap();
+
         let challenge_texture = texture::Texture::from_bytes(
             &device,
             &queue,
@@ -264,11 +236,50 @@ impl State {
             label: Some("challenge_bind_group"),
         });
 
+        let camera = Camera {
+            aspect: config.width as f32 / config.height as f32,
+            ..Default::default()
+        };
+
+        let mut camera_uniform = CameraUniform::new();
+        camera_uniform.update_view_proj(&camera);
+
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera_bind_group_layout"),
+            });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("camera_bind_group"),
+        });
+
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
+                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -320,8 +331,14 @@ impl State {
         });
 
         let num_indices = INDICES.len() as u32;
+        let camera_controller = CameraController::new(0.2);
 
         Self {
+            camera_controller,
+            camera,
+            camera_buffer,
+            camera_uniform,
+            camera_bind_group,
             is_challenge_mode: false,
             window,
             render_pipeline,
@@ -350,7 +367,10 @@ impl State {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
+            self.camera
+                .resize(new_size.width as f32, new_size.height as f32);
             self.surface.configure(&self.device, &self.config);
+            self.update();
         }
     }
 
@@ -362,12 +382,18 @@ impl State {
         self.is_challenge_mode = !self.is_challenge_mode;
     }
 
-    fn input(&mut self, _event: &WindowEvent) -> bool {
-        false
+    fn input(&mut self, event: &WindowEvent) -> bool {
+        self.camera_controller.process_events(&event)
     }
 
     fn update(&mut self) {
-        // todo!()
+        self.camera_controller.update_camera(&mut self.camera);
+        self.camera_uniform.update_view_proj(&self.camera);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -398,13 +424,14 @@ impl State {
 
         render_pass.set_pipeline(&self.render_pipeline);
 
-        let bind_group = if (self.is_challenge_mode) {
+        let bind_group = if self.is_challenge_mode {
             &self.challenge_bind_group
         } else {
             &self.diffuse_bind_group
         };
 
         render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
